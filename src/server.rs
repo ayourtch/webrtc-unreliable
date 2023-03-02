@@ -64,6 +64,32 @@ impl From<IoError> for SendError {
 }
 
 #[derive(Debug)]
+pub enum RecvError {
+    /// Timeout has passed
+    RecvTimeout,
+    /// I/O error on the underlying socket.  May or may not be fatal, depending on the specific
+    /// error.
+    Io(IoError),
+}
+
+impl fmt::Display for RecvError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        match self {
+            RecvError::RecvTimeout => write!(f, "timeout passed with no message received"),
+            RecvError::Io(err) => fmt::Display::fmt(err, f),
+        }
+    }
+}
+
+impl Error for RecvError {}
+
+impl From<IoError> for RecvError {
+    fn from(err: IoError) -> RecvError {
+        RecvError::Io(err)
+    }
+}
+
+#[derive(Debug)]
 pub enum SessionError {
     /// `SessionEndpoint` has beeen disconnected from its `Server` (the `Server` has been dropped).
     Disconnected,
@@ -376,7 +402,25 @@ impl<R: Runtime> Server<R> {
     /// `MessageResult`.
     pub async fn recv(&mut self) -> Result<MessageResult<'_>, IoError> {
         while self.incoming_rtc.is_empty() {
-            self.process().await?;
+            self.process(PERIODIC_TIMER_INTERVAL).await?;
+        }
+
+        let (message, remote_addr, message_type) = self.incoming_rtc.pop_front().unwrap();
+        let message = MessageBuffer(self.buffer_pool.adopt(message));
+        return Ok(MessageResult {
+            message,
+            message_type,
+            remote_addr,
+        });
+    }
+
+    pub async fn recv_with_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<MessageResult<'_>, RecvError> {
+        self.process(timeout).await?;
+        if self.incoming_rtc.is_empty() {
+            return Err(RecvError::RecvTimeout);
         }
 
         let (message, remote_addr, message_type) = self.incoming_rtc.pop_front().unwrap();
@@ -390,7 +434,7 @@ impl<R: Runtime> Server<R> {
 
     // Accepts new incoming WebRTC sessions, times out existing WebRTC sessions, sends outgoing UDP
     // packets, receives incoming UDP packets, and responds to STUN packets.
-    async fn process(&mut self) -> Result<(), IoError> {
+    async fn process(&mut self, periodic_timer_interval: Duration) -> Result<(), IoError> {
         enum Next {
             IncomingSession(IncomingSession),
             IncomingPacket(usize, SocketAddr),
@@ -411,7 +455,7 @@ impl<R: Runtime> Server<R> {
                 let periodic_timer = &mut self.periodic_timer;
                 poll_fn(move |cx| {
                     ready!(periodic_timer.as_mut().poll(cx));
-                    periodic_timer.set(runtime.timer(PERIODIC_TIMER_INTERVAL));
+                    periodic_timer.set(runtime.timer(periodic_timer_interval));
                     Poll::Ready(())
                 })
                 .fuse()
